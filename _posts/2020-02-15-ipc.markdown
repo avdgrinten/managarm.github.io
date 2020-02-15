@@ -1,0 +1,97 @@
+---
+layout: post
+title: 'IPC in Managarm: An Overview'
+---
+<span style="font-size: 11pt;">Post by Alexander van der Grinten
+([@avdgrinten](https://github.com/avdgrinten))
+</span>
+
+## Introduction
+
+This blog post gives an overview of Managarm's IPC mechanisms.
+Managarm uses message-based IPC over so-called *streams* and *lanes*.
+These objects live in Managarm's kernel. To access them
+from userspace, we first need to introduce
+*descriptors*; those constitute Managarm's
+first-class mechanism to represent kernel objects
+in userspace.
+
+## Descriptors, Universes and Handles
+
+A *descriptor* represents some kernel object that can be accessed
+from userspace. In this regard, descriptors are similar to file descriptors
+in UNIX. However, Managarm exposes more than just files through descriptors:
+objects that can be accessed in this way include
+threads, memory regions, virtual address spaces, hardware I/O registers,
+hardware IRQ resources, among others.
+In other microkernels, descriptors are sometimes called "capabilities".
+
+Before a userspace program can use a descriptor,
+the descriptor needs to be assigned a *handle*. This is just a plain
+integer to identify the descriptor. Handles are not global.
+Instead, different threads can have different handles to the
+same descriptor. For this purpose, a *universe* is a kernel object
+that maps handles to descriptors. Each thread has an associated universe
+to manage its handles (and the same universe can be associated with multiple threads).
+
+
+## Streams and Lanes
+
+The fundamental concept of Managarm's IPC is a stream. A stream allows two
+peers (e.g., processes) to communicate. Each stream consists of two lanes,
+i.e., one lane for each peer. However, in contrast to mainstream UNIX-like
+operating system, it is important to note the following differences:
+
+* Communication is done in terms of *messages* and not in terms of bytes. A
+message can transfer bytes and/or other objects such as descriptors.
+* A stream is *neither* a full-duplex nor a half-duplex IPC mechanism. In
+particular, both peers need to agree on which of them acts as a sender and
+which one acts as a receiver, for *each message individually*.
+
+### Messages and Items
+
+To exchange a message, both the sender and the receiver
+post an *item* to their respective lanes.
+Hence, each message consists of exactly two items: one
+at the sending side and one at the receiving side.
+Items identify the message type, which of the lanes
+acts as sender or receiver, and the data to be transmitted.
+The following message types (and corresponding items) exist:
+
+* **Buffers.** Buffers transfer plain bytes. Buffers have fixed
+	maximal sizes that sender and receiver need to agree on.
+	Sending buffers is done by the
+	`SendFromBuffer` item, while `RecvInline` or `RecvToBuffer` is used
+	to receive buffers. `RecvInline` stores the received buffer directly
+	into the kernel-userspace ring. This is useful to receive small
+	buffers without performing additional memory allocations.
+	On the other hand, `RecvToBuffer` specifies
+	an explicit destination pointer.
+* **Descriptors.** The `PushDescriptor` and `PullDescriptor` items
+	can be used to transfer descriptors between different threads.
+* **Accept and Offer.** The two item types `Accept` and `Offer`
+	do not transfer existing resources between threads.
+	Instead, they *create* a new stream and return one lane of the
+	stream to the `Accept`-side and the other lane to the `Offer`-side.
+	This can be used to implement *request-response* logic:
+	typically, requests start by an `Offer`/`Accept` pair to
+	create a per-request stream. The actual request
+	and response buffers are then transfered over the per-request stream.
+	This way, responses and requests are naturally associated with each other,
+	even if multiple messages are exchanged as part of one
+	request-response cycle.
+
+The items that sender and receiver post must be
+complementary, i.e., if a `SendFromBuffer` request is posted to one side
+of a stream and a `PushDescriptor` request is posted to the other side,
+*both* requests fail. The mechanism is visualized in Figure 1.
+In this figure, four messages are exchanged. The third message
+fails (on both sides) since the corresponding item types are not complementary.
+
+![Lanes](/assets/2020-ipc/lanes.png)
+<figcaption style="text-align: center; margin: 0 0 1em 0;">Figure 1: Lanes and items</figcaption>
+
+Similarly, if a `SendToBuffer` request is posted
+with a buffer size that exceeds the buffer size of the corresponding
+`RecvToBuffer`, both the send and the receive item will fail
+(Managarm never truncates buffers).
